@@ -1,0 +1,24 @@
+# Environment & secrets
+.env
+
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Knowledge base (scraped data — optional, exclude if you want to share it)
+knowledge_base/
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
