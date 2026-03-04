@@ -21,4 +21,8 @@ knowledge_base/
 Thumbs.db
 
 # Logs
-*.log
+*.log"fda_knowledge.db" 
+"*.db" 
+".env" 
+"__pycache__/" 
+"venv/" 

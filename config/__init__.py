@@ -1,1 +1,1 @@
-from .config import ANTHROPIC_API_KEY, MODEL, MAX_TOKENS, KB_DIR
+from .config import ANTHROPIC_API_KEY, MODEL, MAX_TOKENS, DB_PATH
