@@ -1,0 +1,65 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "YOUR_MICROSOFT_APP_ID",
+  "packageName": "com.yourcompany.fdaregulatoryagent",
+  "developer": {
+    "name": "Your Company Name",
+    "websiteUrl": "https://your-app.onrender.com",
+    "privacyUrl": "https://your-app.onrender.com/privacy",
+    "termsOfUseUrl": "https://your-app.onrender.com/terms"
+  },
+  "name": {
+    "short": "FDA Agent",
+    "full": "FDA Regulatory Intelligence Agent"
+  },
+  "description": {
+    "short": "Monitor FDA regulations, detect changes, answer compliance questions.",
+    "full": "An AI-powered agent that fetches FDA regulations, detects changes using cryptographic hashing, maintains a full version history, and answers compliance questions in plain English."
+  },
+  "icons": {
+    "outline": "icon-outline.png",
+    "color": "icon-color.png"
+  },
+  "accentColor": "#1B3A5C",
+  "bots": [
+    {
+      "botId": "YOUR_MICROSOFT_APP_ID",
+      "scopes": ["personal"],
+      "isNotificationOnly": false,
+      "supportsCalling": false,
+      "supportsVideo": false,
+      "supportsFiles": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            {
+              "title": "fetch",
+              "description": "Fetch a regulation e.g. fetch 21 CFR Part 117"
+            },
+            {
+              "title": "check changes",
+              "description": "Show what regulations have changed"
+            },
+            {
+              "title": "list",
+              "description": "List all saved regulations"
+            },
+            {
+              "title": "scrape",
+              "description": "Scrape an FDA URL e.g. scrape https://www.fda.gov/..."
+            },
+            {
+              "title": "help",
+              "description": "Show all available commands"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["your-app.onrender.com"]
+}
