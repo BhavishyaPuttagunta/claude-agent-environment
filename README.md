@@ -9,7 +9,7 @@ A ready-to-use environment for building Claude-powered AI agents.
 3. Activate it: `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (Mac/Linux)
 4. Install dependencies: `pip install -r requirements.txt`
 5. Create a `.env` file and add your API key: `ANTHROPIC_API_KEY=your-key`
-6. Run: `python main.py`
+6. Run: `python main2.py`
 
 ## Project Structure
 
