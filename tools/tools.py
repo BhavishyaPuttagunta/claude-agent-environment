@@ -1,144 +1,74 @@
 """
 tools/tools.py
-Tool definitions and execution for the FDA Regulatory Intelligence Agent.
-
-Storage backend: SQLite (fda_knowledge.db) via database/database.py
-  — Replaces flat .txt files in knowledge_base/
-  — Three tables: documents | versions | change_log
+Regulatory Intelligence Agent — simplified URL scraping tools
 
 Tools:
-  fetch_ecfr          — eCFR XML API (full regulation text)
-  fetch_ecfr_versions — official amendment history for a CFR part
-  scrape_url          — HTML scraping for fda.gov / federalregister.gov only
-  save_regulation     — versioned save with SHA-256 change detection → SQLite
-  read_regulation     — read latest (or specific) version from SQLite
-  list_regulations    — list all saved regulations with version counts
-  compare_versions    — unified diff between any two saved versions
-  check_changes       — query the change_log audit table
+  deep_scrape     — scrape a URL + follow links, auto-saves to DB
+  read_regulation — read saved content from DB
+  list_regulations— list all saved pages
+  compare_versions— diff between two saved versions
+  check_changes   — view change audit log
 """
 
 import hashlib
 import difflib
 import requests
-import xml.etree.ElementTree as ET
 from datetime import datetime
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
-from config.config import (
-    SCRAPE_TIMEOUT, MAX_CONTENT_CHARS, USER_AGENT,
-    ECFR_API_BASE, SIGNIFICANT_CHANGE_THRESHOLD
-)
+from config.config import SCRAPE_TIMEOUT, MAX_CONTENT_CHARS, USER_AGENT, SIGNIFICANT_CHANGE_THRESHOLD
 from database.database import (
     init_db, save_regulation, get_latest, get_version,
-    list_regulations, list_versions, get_change_log, get_stats
+    list_regulations, get_change_log, get_stats
 )
 
-# Initialise DB on import — creates tables if they don't exist
 init_db()
 
-
-# ── Approved scraping domains ─────────────────────────────────────────────────
+# ── Approved domains ──────────────────────────────────────────────────────────
 ALLOWED_DOMAINS = {
     "fda.gov", "www.fda.gov",
     "federalregister.gov", "www.federalregister.gov",
     "hhs.gov", "www.hhs.gov",
     "cdc.gov", "www.cdc.gov",
-    "nih.gov", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov",
+    "nih.gov", "www.nih.gov", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov",
     "iso.org", "www.iso.org",
     "ich.org", "www.ich.org",
-    # eCFR allowed for fallback HTML scraping when XML API fails
-    # Note: fetch_ecfr() uses the API directly and bypasses this check
-    "www.ecfr.gov", "ecfr.gov",
+    "ecfr.gov", "www.ecfr.gov",
+    "usda.gov", "www.usda.gov",
+    "fsis.usda.gov", "www.fsis.usda.gov",
+    "foodsafety.gov", "www.foodsafety.gov",
+    "epa.gov", "www.epa.gov",
+    "osha.gov", "www.osha.gov",
 }
 
-
-def _is_allowed(url: str) -> tuple[bool, str]:
-    from urllib.parse import urlparse
-    try:
-        domain = urlparse(url).netloc.lower().split(":")[0]
-        return domain in ALLOWED_DOMAINS, domain
-    except Exception:
-        return False, "unknown"
-
-
-# ── Tool Schemas (sent to Claude) ─────────────────────────────────────────────
+# ── Tool Definitions ──────────────────────────────────────────────────────────
 TOOL_DEFINITIONS = [
     {
-        "name": "fetch_ecfr",
+        "name": "deep_scrape",
         "description": (
-            "Fetch the FULL TEXT of any CFR part from the official eCFR XML API. "
-            "ALWAYS use this for 21 CFR content — returns complete regulation text, not a TOC. "
-            "Works for: Part 820 (QSR/QMSR), Part 11 (Electronic Records), "
-            "Part 210/211 (cGMP), Part 803 (MDR), Part 806 (Recalls), Part 814 (PMA)."
+            "Scrape a URL and follow its internal links to gather complete content. "
+            "AUTO-SAVES the result to the knowledge base — do NOT call save_regulation after this. "
+            "Use this whenever a user provides a URL to monitor. "
+            "If the page was scraped before, automatically detects and reports changes."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "title": {"type": "integer", "description": "CFR title (21 = Food & Drugs)"},
-                "part":  {"type": "integer", "description": "CFR part number e.g. 820, 11, 210"},
-            },
-            "required": ["title", "part"],
-        },
-    },
-    {
-        "name": "fetch_ecfr_versions",
-        "description": "Check the official amendment history for a CFR part — all dates it was formally changed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "integer", "description": "CFR title number"},
-                "part":  {"type": "integer", "description": "CFR part number"},
-            },
-            "required": ["title", "part"],
-        },
-    },
-    {
-        "name": "scrape_url",
-        "description": (
-            "Scrape a web page for FDA content. "
-            "Use ONLY for fda.gov guidance docs, federalregister.gov notices, or non-CFR FDA pages. "
-            "Do NOT use for CFR regulations — use fetch_ecfr instead."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url":   {"type": "string", "description": "Full URL to scrape"},
-                "label": {"type": "string", "description": "Short identifier e.g. 'FDA_UDI_guidance'"},
+                "url":       {"type": "string",  "description": "Full URL to scrape e.g. https://www.fda.gov/food/..."},
+                "label":     {"type": "string",  "description": "Short identifier to save as e.g. 'fda_food_labeling'"},
+                "max_pages": {"type": "integer", "description": "Max pages to follow (default 10, max 25)"},
             },
             "required": ["url", "label"],
         },
     },
     {
-        "name": "save_regulation",
-        "description": (
-            "Save fetched content to the SQLite knowledge base with full versioning. "
-            "CRITICAL: The 'content' parameter MUST be the COMPLETE TEXT returned by fetch_ecfr or scrape_url — "
-            "copy the entire return value verbatim into the content field. Do NOT summarize or truncate it. "
-            "Returns NEW / CHANGED / UNCHANGED based on SHA-256 hash comparison."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "regulation_id": {"type": "string",  "description": "Identifier e.g. '21CFR820'"},
-                "content":       {"type": "string",  "description": "The COMPLETE return value from fetch_ecfr or scrape_url — must be the full text, not a summary"},
-                "source_url":    {"type": "string",  "description": "URL it was fetched from"},
-                "version_note":  {"type": "string",  "description": "Brief note e.g. 'eCFR XML API 2026-02-25'"},
-                "title":         {"type": "integer", "description": "CFR title number e.g. 21"},
-                "part":          {"type": "integer", "description": "CFR part number e.g. 820"},
-            },
-            "required": ["regulation_id", "content"],
-        },
-    },
-    {
         "name": "read_regulation",
-        "description": (
-            "Read a saved regulation from the knowledge base. "
-            "Returns the latest version by default, or a specific version number."
-        ),
+        "description": "Read saved content from the knowledge base by its label.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "regulation_id":  {"type": "string",  "description": "e.g. '21CFR820'"},
+                "regulation_id":  {"type": "string",  "description": "The label used when saving e.g. 'fda_food_labeling'"},
                 "version_number": {"type": "integer", "description": "Specific version to read (omit for latest)"},
             },
             "required": ["regulation_id"],
@@ -146,25 +76,21 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "list_regulations",
-        "description": "List all regulations in the knowledge base with version counts, sizes, and last-fetched dates.",
+        "description": "List all saved pages in the knowledge base with version counts and last-scraped dates.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "filter": {"type": "string", "description": "Optional filter e.g. 'CFR820' or 'FDA'"},
+                "filter": {"type": "string", "description": "Optional keyword filter"},
             },
         },
     },
     {
         "name": "compare_versions",
-        "description": (
-            "Compare two saved versions of a regulation using a proper unified diff. "
-            "Shows exactly which lines were added (+) or removed (-) with context. "
-            "Always run this when save_regulation returns CHANGED."
-        ),
+        "description": "Compare two saved versions of a page. Shows exactly what lines were added or removed. Run this when deep_scrape reports CHANGED.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "regulation_id": {"type": "string",  "description": "e.g. '21CFR820'"},
+                "regulation_id": {"type": "string",  "description": "Label of the saved page"},
                 "version_a":     {"type": "integer", "description": "Older version number"},
                 "version_b":     {"type": "integer", "description": "Newer version number (omit for latest)"},
             },
@@ -173,16 +99,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "check_changes",
-        "description": (
-            "Query the change audit log — every save event with NEW/CHANGED/UNCHANGED status, "
-            "timestamps, and hashes. Use to monitor what has changed over time."
-        ),
+        "description": "View the change audit log — every scrape event showing NEW / CHANGED / UNCHANGED.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "filter":       {"type": "string",  "description": "Optional regulation ID filter"},
-                "limit":        {"type": "integer", "description": "Max entries to return (default 20)"},
-                "changed_only": {"type": "boolean", "description": "If true, only show CHANGED entries"},
+                "filter":       {"type": "string",  "description": "Optional label filter"},
+                "limit":        {"type": "integer", "description": "Max entries (default 20)"},
+                "changed_only": {"type": "boolean", "description": "Only show CHANGED entries"},
             },
         },
     },
@@ -193,20 +116,11 @@ TOOL_DEFINITIONS = [
 def execute_tool(name: str, inputs: dict) -> str:
     try:
         match name:
-            case "fetch_ecfr":
-                return _fetch_ecfr(inputs["title"], inputs["part"])
-            case "fetch_ecfr_versions":
-                return _fetch_ecfr_versions(inputs["title"], inputs["part"])
-            case "scrape_url":
-                return _scrape_url(inputs["url"], inputs["label"])
-            case "save_regulation":
-                return _save_regulation(
-                    inputs["regulation_id"],
-                    inputs["content"],
-                    inputs.get("source_url", ""),
-                    inputs.get("version_note", ""),
-                    inputs.get("title"),
-                    inputs.get("part"),
+            case "deep_scrape":
+                return _deep_scrape(
+                    inputs["url"],
+                    inputs["label"],
+                    inputs.get("max_pages", 10),
                 )
             case "read_regulation":
                 return _read_regulation(inputs["regulation_id"], inputs.get("version_number"))
@@ -230,82 +144,89 @@ def execute_tool(name: str, inputs: dict) -> str:
         return f"ERROR in {name}: {type(e).__name__}: {str(e)}"
 
 
-# ── fetch_ecfr ────────────────────────────────────────────────────────────────
-def _fetch_ecfr(title: int, part: int) -> str:
-    """
-    Fetch full regulation text from the eCFR XML API.
+# ── deep_scrape ───────────────────────────────────────────────────────────────
+def _deep_scrape(url: str, label: str, max_pages: int = 10) -> str:
+    # Domain check
+    domain = urlparse(url).netloc.lower().split(":")[0]
+    if domain not in ALLOWED_DOMAINS:
+        return (
+            f"❌ BLOCKED — '{domain}' is not an approved source.\n"
+            f"Allowed: {', '.join(sorted(ALLOWED_DOMAINS))}"
+        )
 
-    Tries multiple date fallbacks because:
-    - Some parts have gaps (e.g. Part 820 was restructured Feb 2026)
-    - The API returns 404 if the part had no content on that exact date
-    Strategy: try today, then walk back week by week up to 1 year
-    """
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/xml, text/xml, */*"}
-    from datetime import timedelta
+    max_pages = min(max_pages or 10, 25)
+    MAX_DEPTH = 2
 
-    # Build a list of dates to try: today, then weekly fallbacks up to 52 weeks
-    base_date = datetime.now()
-    dates_to_try = [base_date - timedelta(weeks=w) for w in range(0, 53, 1)]
+    SKIP_PATTERNS = [
+        "/login", "/logout", "/signin", "/search", "/cart", "/account",
+        "/careers", "/jobs", "/press", "/sitemap", "/privacy", "/disclaimer",
+        "/foia", "/feedback", "/share", "/print", "javascript:", "mailto:", "tel:",
+    ]
+    CONTENT_PATTERNS = [
+        "/guidance", "/regulation", "/rule", "/cfr", "/part-", "/section-",
+        "/chapter", "/subpart", "/document", "/docket", "/notice",
+        "/compliance", "/enforcement", "/advisory", "/draft", "/final",
+        "/food", "/drug", "/device", "/safety", "/labeling", "/inspection",
+        "/ucm", "/recall",
+    ]
 
-    last_error = None
-    for attempt_date in dates_to_try:
-        date_str = attempt_date.strftime("%Y-%m-%d")
-        url = f"{ECFR_API_BASE}/full/{date_str}/title-{title}.xml"
-        try:
-            response = requests.get(
-                url, headers=headers, params={"part": part},
-                timeout=SCRAPE_TIMEOUT
-            )
-            if response.status_code == 404:
-                last_error = f"404 on {date_str}"
+    headers  = {"User-Agent": USER_AGENT}
+    visited  = set()
+    queue    = [(url, 0)]
+    pages    = []
+    root_domain = urlparse(url).netloc.lower()
+    total_chars = 0
+    BUDGET = MAX_CONTENT_CHARS
+
+    def _extract_links(page_url, html):
+        soup = BeautifulSoup(html, "lxml")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
-            response.raise_for_status()
-
-            # Parse XML → clean text
-            try:
-                root = ET.fromstring(response.content)
-                text = _xml_to_text(root).strip()
-            except ET.ParseError:
-                text = response.text.strip()
-
-            # Validate we got real content, not just a shell
-            if len(text) < 200:
-                last_error = f"Only {len(text)} chars on {date_str} — skipping"
+            if any(p in href.lower() for p in SKIP_PATTERNS):
                 continue
-
-            if len(text) > MAX_CONTENT_CHARS:
-                text = text[:MAX_CONTENT_CHARS] + f"\n\n[... truncated at {MAX_CONTENT_CHARS:,} chars ...]"
-
-            note = f" (fetched from archive date {date_str})" if date_str != base_date.strftime("%Y-%m-%d") else ""
-            return (
-                f"SOURCE: eCFR Official XML API — Title {title}, Part {part}{note}\n"
-                f"URL: {url}?part={part}\n"
-                f"FETCHED: {datetime.now().isoformat()}\n"
-                f"ARCHIVE DATE USED: {date_str}\n"
-                f"{'='*60}\n\n"
-                f"{text}"
+            full = urljoin(page_url, href).split("#")[0].split("?")[0]
+            parsed = urlparse(full)
+            if parsed.netloc.lower() != root_domain:
+                continue
+            path = parsed.path.lower()
+            anchor = a.get_text(strip=True).lower()
+            looks_like_content = any(p in path for p in CONTENT_PATTERNS)
+            anchor_looks_like_content = any(
+                w in anchor for w in
+                ["section", "part", "§", "cfr", "guidance", "regulation",
+                 "requirement", "compliance", "chapter", "rule", "notice"]
             )
-        except requests.HTTPError as e:
-            last_error = str(e)
+            if looks_like_content or anchor_looks_like_content:
+                links.append(full)
+        return links
+
+    while queue and len(pages) < max_pages:
+        current_url, depth = queue.pop(0)
+        if current_url in visited:
             continue
+        visited.add(current_url)
+
+        depth_str = "  " * depth + f"[d{depth}]"
+        print(f"  🕷️  {depth_str} [{len(pages)+1}/{max_pages}]: {current_url[:70]}")
+
+        try:
+            resp = requests.get(current_url, headers=headers, timeout=SCRAPE_TIMEOUT)
+            resp.raise_for_status()
+            html = resp.text
         except Exception as e:
-            return f"ERROR in fetch_ecfr: {type(e).__name__}: {e}"
+            print(f"    ⚠️  Failed: {e}")
+            continue
 
-    # ── All API dates failed — fall back to scraping the eCFR HTML page ─────
-    print(f"  ⚠️  XML API exhausted ({len(dates_to_try)} dates tried). Falling back to HTML scrape...")
-    fallback_url = f"https://www.ecfr.gov/current/title-{title}/part-{part}"
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        resp = requests.get(fallback_url, headers=headers, timeout=SCRAPE_TIMEOUT)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(html, "lxml")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
             tag.decompose()
-
         main = (
             soup.find("main") or soup.find("article")
             or soup.find("div", {"id": "main-content"})
+            or soup.find("div", {"class": "content"})
             or soup.body or soup
         )
         text = "\n".join(
@@ -313,170 +234,81 @@ def _fetch_ecfr(title: int, part: int) -> str:
             if line.strip()
         )
 
-        if len(text) < 200:
-            raise ValueError(f"HTML fallback returned only {len(text)} chars — likely JS-gated")
+        if len(text) > 100:
+            page_cap = BUDGET // max(max_pages, 1)
+            if len(text) > page_cap:
+                text = text[:page_cap] + f"\n[... truncated at {page_cap:,} chars ...]"
+            pages.append((current_url, depth, text))
+            total_chars += len(text)
 
-        if len(text) > MAX_CONTENT_CHARS:
-            text = text[:MAX_CONTENT_CHARS] + f"\n\n[... truncated at {MAX_CONTENT_CHARS:,} chars ...]"
+        if depth < MAX_DEPTH and len(pages) < max_pages:
+            new_links = _extract_links(current_url, html)
+            added = 0
+            for lnk in new_links:
+                if lnk not in visited:
+                    queue.append((lnk, depth + 1))
+                    added += 1
+            if added:
+                print(f"    ↳  {added} links queued at depth {depth+1}")
 
+        if total_chars >= BUDGET:
+            print(f"  ⚠️  Budget reached. Stopping.")
+            break
+
+    if not pages:
         return (
-            f"SOURCE: eCFR HTML fallback (XML API unavailable) — Title {title}, Part {part}\n"
-            f"URL: {fallback_url}\n"
-            f"FETCHED: {datetime.now().isoformat()}\n"
-            f"NOTE: XML API returned 404 for all dates tried. Using HTML scrape — content may be incomplete.\n"
-            f"{'='*60}\n\n"
-            f"{text}"
-        )
-    except Exception as fallback_err:
-        return (
-            f"ERROR: Could not fetch Title {title} Part {part} via XML API or HTML fallback.\n"
-            f"XML API: tried {len(dates_to_try)} dates, last error: {last_error}\n"
-            f"HTML fallback ({fallback_url}): {fallback_err}\n\n"
-            f"The eCFR site uses JavaScript rendering — HTML scraping may return nav text only.\n"
-            f"Suggested alternatives:\n"
-            f"  1. Use scrape_url on https://www.fda.gov to find guidance on this topic\n"
-            f"  2. Use scrape_url on https://www.federalregister.gov to find the final rule\n"
-            f"  3. Paste the regulation text directly and use save_regulation to store it"
-        )
-
-
-def _xml_to_text(root: ET.Element, depth: int = 0) -> str:
-    lines = []
-    indent = "  " * depth
-    tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
-
-    if tag in ("HEAD", "SUBJECT"):
-        text = (root.text or "").strip()
-        if text:
-            if depth <= 2:
-                lines.append(f"\n{'='*60}\n{text}\n{'='*60}")
-            elif depth <= 4:
-                lines.append(f"\n{indent}{'─'*40}\n{indent}{text}")
-            else:
-                lines.append(f"\n{indent}▸ {text}")
-
-    elif tag == "SECTNO":
-        text = (root.text or "").strip()
-        if text:
-            lines.append(f"\n{indent}{text}")
-
-    elif tag in ("P", "FP", "PSPACE", "FP-1", "FP-2"):
-        parts = []
-        if root.text:
-            parts.append(root.text.strip())
-        for child in root:
-            ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-            if ctag in ("E", "I", "B", "SU", "SUB", "SUP"):
-                if child.text:
-                    parts.append(child.text.strip())
-                if child.tail:
-                    parts.append(child.tail.strip())
-        text = " ".join(p for p in parts if p)
-        if text:
-            lines.append(f"{indent}  {text}")
-
-    if tag not in ("P", "FP", "PSPACE", "FP-1", "FP-2", "HEAD", "SUBJECT", "SECTNO"):
-        for child in root:
-            child_text = _xml_to_text(child, depth + 1)
-            if child_text:
-                lines.append(child_text)
-
-    return "\n".join(l for l in lines if l)
-
-
-# ── fetch_ecfr_versions ───────────────────────────────────────────────────────
-def _fetch_ecfr_versions(title: int, part: int) -> str:
-    url = f"{ECFR_API_BASE}/versions/title-{title}/part-{part}.json"
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=SCRAPE_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-
-    versions = data.get("content_versions", [])
-    if not versions:
-        return f"No version history found for Title {title} Part {part}."
-
-    lines = [f"📅 Amendment History — Title {title}, Part {part} ({len(versions)} entries)\n"]
-    for v in versions[:30]:
-        lines.append(f"  • {v.get('date','?')}  {v.get('identifier','')}  {v.get('name','')}".rstrip())
-    return "\n".join(lines)
-
-
-# ── scrape_url ────────────────────────────────────────────────────────────────
-def _scrape_url(url: str, label: str) -> str:
-    allowed, domain = _is_allowed(url)
-    if not allowed:
-        return (
-            f"❌ BLOCKED — '{domain}' is not an approved FDA/regulatory source.\n"
-            f"Allowed domains: {', '.join(sorted(ALLOWED_DOMAINS))}\n"
-            f"To add a domain, update ALLOWED_DOMAINS in tools/tools.py."
+            f"❌ No content retrieved from {url}\n"
+            f"The page may require JavaScript or login."
         )
 
-    headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
-    response.raise_for_status()
+    # Build full content
+    content_parts = [
+        f"SOURCE: {url}",
+        f"LABEL: {label}",
+        f"SCRAPED: {datetime.now().isoformat()}",
+        f"PAGES: {len(pages)}",
+        f"MAX DEPTH: {max(d for _,d,_ in pages)}",
+        f"TOTAL CHARS: {total_chars:,}",
+        "=" * 60,
+    ]
+    for i, (page_url, page_depth, page_text) in enumerate(pages, 1):
+        content_parts.append(f"\n--- PAGE {i}/{len(pages)} (depth {page_depth}): {page_url} ---\n")
+        content_parts.append(page_text)
 
-    soup = BeautifulSoup(response.text, "lxml")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-        tag.decompose()
+    full_content = "\n".join(content_parts)
 
-    main = (
-        soup.find("main") or soup.find("article")
-        or soup.find("div", {"id": "main-content"})
-        or soup.body or soup
-    )
-    text = "\n".join(
-        line for line in main.get_text(separator="\n", strip=True).splitlines() if line.strip()
-    )
-
-    if len(text) > MAX_CONTENT_CHARS:
-        text = text[:MAX_CONTENT_CHARS] + f"\n\n[... truncated at {MAX_CONTENT_CHARS:,} chars ...]"
-
-    return (
-        f"SOURCE: {url}\nLABEL: {label}\nSCRAPED: {datetime.now().isoformat()}\n{'='*60}\n\n{text}"
-    )
-
-
-# ── save_regulation ───────────────────────────────────────────────────────────
-def _save_regulation(
-    regulation_id: str,
-    content: str,
-    source_url: str = "",
-    version_note: str = "",
-    title: int = None,
-    part: int = None,
-) -> str:
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-
+    # Auto-save to DB
+    content_hash = hashlib.sha256(full_content.encode("utf-8")).hexdigest()[:16]
     result = save_regulation(
-        regulation_id=regulation_id,
-        content=content,
+        regulation_id=label,
+        content=full_content,
         content_hash=content_hash,
-        source_url=source_url,
-        version_note=version_note,
-        title=title,
-        part=part,
+        source_url=url,
+        version_note=f"deep_scrape {len(pages)} pages",
     )
 
     status  = result["status"]
     version = result["version_number"]
 
-    if status == "UNCHANGED":
-        return (
-            f"✅ UNCHANGED — identical to version {version} (hash: {content_hash}).\n"
-            f"   Regulation has not changed since last fetch. No new version stored."
-        )
-    elif status == "NEW":
-        return (
-            f"✅ NEW — '{regulation_id}' saved as version 1 (hash: {content_hash}).\n"
-            f"   Stored in SQLite: fda_knowledge.db → versions table."
-        )
+    if status == "NEW":
+        save_msg = f"✅ NEW — saved as version 1"
+    elif status == "UNCHANGED":
+        save_msg = f"✅ UNCHANGED — identical to version {version} (no changes since last scrape)"
     else:
-        return (
-            f"⚠️  CHANGED — new version {version} saved for '{regulation_id}'.\n"
-            f"   Previous hash: {result['prev_hash']}  →  New hash: {content_hash}\n"
-            f"   Stored in SQLite: fda_knowledge.db → versions table.\n"
-            f"   → Run compare_versions to see exactly what changed."
-        )
+        save_msg = f"⚠️  CHANGED — new version {version} saved. Run compare_versions to see what changed."
+
+    crawled = "\n".join(f"  [d{d}] {u}" for u,d,_ in pages[:10])
+    if len(pages) > 10:
+        crawled += f"\n  ... and {len(pages)-10} more"
+
+    return (
+        f"{save_msg}\n"
+        f"Label   : {label}\n"
+        f"Pages   : {len(pages)}\n"
+        f"Chars   : {total_chars:,}\n"
+        f"Version : {version}\n"
+        f"URLs scraped:\n{crawled}"
+    )
 
 
 # ── read_regulation ───────────────────────────────────────────────────────────
@@ -490,45 +322,47 @@ def _read_regulation(regulation_id: str, version_number: int = None) -> str:
 
     if not row:
         regs = [r["regulation_id"] for r in list_regulations()]
-        hint = f"Available: {', '.join(regs)}" if regs else "No regulations saved yet."
-        return f"ERROR: '{regulation_id}' not found ({label}). {hint}"
+        hint = f"Available: {', '.join(regs)}" if regs else "Nothing saved yet — provide a URL to get started."
+        return f"'{regulation_id}' not found ({label}). {hint}"
 
     header = (
-        f"REGULATION: {regulation_id}\n"
-        f"VERSION:    {row['version_number']}\n"
-        f"STATUS:     {row['status']}\n"
-        f"HASH:       {row['content_hash']}\n"
-        f"SAVED:      {row['saved_at']}\n"
-        f"SIZE:       {row['content_length']:,} chars\n"
+        f"LABEL:   {regulation_id}\n"
+        f"VERSION: {row['version_number']}\n"
+        f"STATUS:  {row['status']}\n"
+        f"SAVED:   {row['saved_at']}\n"
+        f"SIZE:    {row['content_length']:,} chars\n"
         f"{'='*60}\n\n"
     )
-    return header + row["content"]
+    # Return header + truncated content so Claude's context doesn't overflow
+    content = row["content"]
+    if len(content) > 3000:
+        content = content[:3000] + f"\n\n[... content truncated for display. Full content is {row['content_length']:,} chars ...]"
+    return header + content
 
 
 # ── list_regulations ──────────────────────────────────────────────────────────
 def _list_regulations(filter_str: str = "") -> str:
     rows = list_regulations(filter_str)
     if not rows:
-        return "Knowledge base is empty." + (f" (filter: '{filter_str}')" if filter_str else "")
+        msg = "Knowledge base is empty."
+        if filter_str:
+            msg += f" (filter: '{filter_str}')"
+        msg += " Ask the user to provide a URL to scrape."
+        return msg
 
     stats = get_stats()
     lines = [
-        f"📚 Knowledge Base — {stats['regulations']} regulation(s) | "
+        f"📚 Knowledge Base — {stats['regulations']} page(s) saved | "
         f"{stats['total_versions']} total versions | "
-        f"{stats['db_size_kb']} KB (fda_knowledge.db)\n"
+        f"{stats['db_size_kb']} KB\n"
     ]
-
     for r in rows:
         size_kb = (r.get("content_length") or 0) / 1024
-        lines.append(
-            f"\n  📋 {r['regulation_id']}"
-            f"  (Title {r.get('title') or '?'}, Part {r.get('part') or '?'})"
-        )
-        lines.append(f"      Versions:     {r.get('total_versions', 0)}")
-        lines.append(f"      Latest:       v{r.get('latest_version_number','?')}  [{size_kb:.1f} KB]  status: {r.get('latest_status','?')}")
-        lines.append(f"      Last fetched: {r.get('last_fetched','?')}")
-        lines.append(f"      Source:       {r.get('source_url') or 'eCFR API'}")
-
+        lines.append(f"  📋 {r['regulation_id']}")
+        lines.append(f"      Versions    : {r.get('total_versions', 0)}")
+        lines.append(f"      Latest      : v{r.get('latest_version_number','?')} [{size_kb:.1f} KB] status: {r.get('latest_status','?')}")
+        lines.append(f"      Last scraped: {r.get('last_fetched','?')}")
+        lines.append(f"      Source      : {r.get('source_url','?')}\n")
     return "\n".join(lines)
 
 
@@ -536,7 +370,7 @@ def _list_regulations(filter_str: str = "") -> str:
 def _compare_versions(regulation_id: str, version_a: int, version_b: int = None) -> str:
     row_a = get_version(regulation_id, version_a)
     if not row_a:
-        return f"ERROR: Version {version_a} of '{regulation_id}' not found."
+        return f"Version {version_a} of '{regulation_id}' not found."
 
     if version_b is None:
         row_b = get_latest(regulation_id)
@@ -545,7 +379,7 @@ def _compare_versions(regulation_id: str, version_a: int, version_b: int = None)
         row_b = get_version(regulation_id, version_b)
 
     if not row_b:
-        return f"ERROR: Version {version_b} of '{regulation_id}' not found."
+        return f"Version {version_b} of '{regulation_id}' not found."
 
     if version_a == version_b:
         return "✅ Same version — nothing to compare."
@@ -555,8 +389,8 @@ def _compare_versions(regulation_id: str, version_a: int, version_b: int = None)
 
     diff = list(difflib.unified_diff(
         lines_a, lines_b,
-        fromfile=f"{regulation_id} v{version_a} ({row_a['saved_at'][:10]})",
-        tofile=f"{regulation_id} v{version_b} ({row_b['saved_at'][:10]})",
+        fromfile=f"v{version_a} ({row_a['saved_at'][:10]})",
+        tofile=f"v{version_b} ({row_b['saved_at'][:10]})",
         n=3,
     ))
 
@@ -570,15 +404,14 @@ def _compare_versions(regulation_id: str, version_a: int, version_b: int = None)
 
     header = (
         f"DIFF: {regulation_id}  v{version_a} → v{version_b}\n{'='*60}\n"
-        f"Lines added:   +{added}\n"
-        f"Lines removed: -{removed}\n"
-        f"Change level:  {level} ({pct:.1f}% of document)\n"
+        f"Lines added   : +{added}\n"
+        f"Lines removed : -{removed}\n"
+        f"Change level  : {level} ({pct:.1f}% of document)\n"
         f"{'='*60}\n\n"
     )
-
-    diff_text = "".join(diff[:400])
-    if len(diff) > 400:
-        diff_text += f"\n[... {len(diff)-400} more diff lines not shown ...]"
+    diff_text = "".join(diff[:300])
+    if len(diff) > 300:
+        diff_text += f"\n[... {len(diff)-300} more diff lines not shown ...]"
 
     return header + diff_text
 
@@ -586,19 +419,16 @@ def _compare_versions(regulation_id: str, version_a: int, version_b: int = None)
 # ── check_changes ─────────────────────────────────────────────────────────────
 def _check_changes(filter_str: str = "", limit: int = 20, changed_only: bool = False) -> str:
     entries = get_change_log(filter_str, limit, changed_only)
-
     if not entries:
         return "No change log entries found" + (f" for '{filter_str}'." if filter_str else ".")
 
     icons = {"NEW": "🆕", "CHANGED": "⚠️ ", "UNCHANGED": "✅"}
-    lines = [f"📋 Change Log — {len(entries)} entries (most recent first)\n"]
+    lines = [f"📋 Change Log — {len(entries)} entries\n"]
     for e in entries:
         icon = icons.get(e["status"], "❓")
         lines.append(
             f"  {icon} [{e['logged_at'][:19]}]  {e['regulation_id']}\n"
-            f"      Status:  {e['status']}  |  Version: {e.get('version_number','?')}"
-            f"  |  Hash: {e['content_hash']}\n"
-            f"      Note:    {e.get('version_note') or '—'}"
+            f"      Status: {e['status']}  |  Version: {e.get('version_number','?')}  |  Hash: {e['content_hash']}\n"
+            f"      Note  : {e.get('version_note') or '—'}"
         )
-
     return "\n".join(lines)

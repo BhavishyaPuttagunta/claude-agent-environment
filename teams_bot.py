@@ -41,6 +41,12 @@ APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 ADAPTER  = BotFrameworkAdapter(SETTINGS)
 
+# If no password is set, disable auth validation so we can test without
+# a full Azure app registration. Remove this once IT provides credentials.
+if not APP_PASSWORD:
+    ADAPTER._credentials_provider = None
+    print("[TeamsBot] ⚠️  No MicrosoftAppPassword set — running in auth-bypass mode")
+
 # ── One agent per user — keeps conversation memory per Teams user ─────────────
 _agents: dict[str, FDAgent] = {}
 

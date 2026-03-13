@@ -26,3 +26,5 @@ Thumbs.db
 ".env" 
 "__pycache__/" 
 "venv/" 
+"fda_knowledge.db" 
+fda_knowledge.db 

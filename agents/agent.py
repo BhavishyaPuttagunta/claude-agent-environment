@@ -1,6 +1,11 @@
 """
 agents/agent.py
-FDA Regulatory Intelligence Agent — multi-turn memory, streaming, tool use, SQLite versioning
+Regulatory Intelligence Agent — simplified URL scraping flow
+
+Core flow:
+  1. User gives a URL → agent scrapes and saves it (auto-saved by deep_scrape)
+  2. User asks questions → agent reads from knowledge base
+  3. User gives same URL again → agent scrapes, compares, reports changes
 """
 
 import anthropic
@@ -8,50 +13,37 @@ import json
 from tools.tools import TOOL_DEFINITIONS, execute_tool
 from config.config import MODEL, MAX_TOKENS
 
-SYSTEM_PROMPT = """You are an FDA Regulatory Intelligence Agent. You monitor, track, and explain FDA regulations using a SQLite knowledge base.
+SYSTEM_PROMPT = """You are a Regulatory Intelligence Agent. You help users monitor regulatory and compliance web pages for changes.
 
-## Tools & When to Use Them
+## Your Core Flow
 
-| Task                                  | Tool                  |
-|---------------------------------------|-----------------------|
-| Fetch any 21 CFR regulation           | fetch_ecfr            |
-| Check when a CFR part was amended     | fetch_ecfr_versions   |
-| Fetch fda.gov / federalregister.gov   | scrape_url            |
-| Save after every fetch                | save_regulation       |
-| Read a saved regulation               | read_regulation       |
-| Browse saved regulations              | list_regulations      |
-| See what changed between two versions | compare_versions      |
-| Review change history / audit log     | check_changes         |
+1. User gives you a URL → scrape it with deep_scrape → it auto-saves to knowledge base
+2. User asks a question about saved content → use read_regulation or list_regulations
+3. User gives the same URL again → scrape it again → compare_versions shows what changed
 
-## Strict Rules
-1. After EVERY fetch_ecfr or scrape_url — immediately call save_regulation, passing the COMPLETE return text as the content field
-2. CRITICAL: When calling save_regulation, the content field MUST be the full raw text returned by fetch_ecfr/scrape_url — never omit it, never summarize it
-3. Before answering about a regulation — call list_regulations first, then read_regulation if it exists, else fetch it
-4. When save_regulation returns ⚠️ CHANGED — immediately run compare_versions and summarise what changed
-5. Always cite specific section numbers (§820.30 not just "design controls")
-6. Always state the fetch date AND archive date so users know how current the data is
-7. fetch_ecfr auto-retries with older dates if today returns 404 — always let it run fully before concluding a part is missing
-8. If fetch_ecfr fails completely, try scrape_url on www.ecfr.gov as a fallback
+## Tools
 
-## Key Regulatory Context (as of 2026)
-- 21 CFR Part 820 (QSR) was REPLACED by QMSR effective February 2, 2026
-  The new QMSR is still numbered Part 820 but now incorporates ISO 13485:2016 by reference
-  fetch_ecfr will automatically find the correct archive date
-- 21 CFR Part 11 covers Electronic Records and Electronic Signatures (unchanged)
-- 21 CFR Part 210/211 covers drug cGMP (unchanged)
-- 21 CFR Part 803 covers Medical Device Reporting (MDR)
+| Task                                   | Tool             |
+|----------------------------------------|------------------|
+| Scrape a URL and save it (auto-saves)  | deep_scrape      |
+| Read saved content from knowledge base | read_regulation  |
+| List all saved pages                   | list_regulations |
+| Compare two versions of a saved page   | compare_versions |
+| View full change history               | check_changes    |
 
-## When fetch_ecfr Returns an Error
-1. Try fetch_ecfr_versions first — confirms if the part exists and when it was last amended
-2. Try scrape_url on https://www.ecfr.gov/current/title-{N}/part-{N} as fallback
-3. Try scrape_url on https://www.fda.gov for guidance documents on that topic
-4. Always save whatever content you retrieve — partial content is better than nothing
+## Rules
+
+1. When user gives a URL → always use deep_scrape. It auto-saves — do NOT call save_regulation after deep_scrape.
+2. When user asks about a topic → call list_regulations first, then read_regulation to get content.
+3. When deep_scrape says CHANGED → immediately call compare_versions and summarise what changed.
+4. Never make up content — only answer from what is in the knowledge base.
+5. Always tell the user when the page was last scraped and how many versions exist.
 
 ## Response Style
-- Lead with the key finding
-- Flag ⚠️ CHANGED items as requiring compliance team review  
-- Be specific and concise — compliance teams are busy
-- If using archived content, always note the archive date prominently
+- Be concise and clear
+- Always mention the source URL and date scraped
+- Highlight changes with ⚠️ when content has changed
+- If nothing is saved yet, ask the user to provide a URL to get started
 """
 
 
@@ -59,20 +51,20 @@ class FDAgent:
     def __init__(self):
         self.client = anthropic.Anthropic()
         self.history = []
-        print("\n🏥  FDA Regulatory Intelligence Agent")
+        print("\n🏥  Regulatory Intelligence Agent")
         print("=" * 50)
-        print("Storage: SQLite (fda_knowledge.db)")
+        from config.config import DB_SERVER, DB_NAME; print(f"Storage: SQL Server ({DB_SERVER}/{DB_NAME})")
         print("Commands: 'exit' | 'clear' | 'history'")
         print("\nExamples:")
-        print("  • Fetch 21 CFR Part 820 and save it")
-        print("  • What are the requirements in 21 CFR Part 11?")
-        print("  • Has 21 CFR Part 820 changed since last fetch?")
-        print("  • Show me the change log\n")
+        print("  • Scrape https://www.fda.gov/food/... and save it as fda_food")
+        print("  • What does the saved page say about labeling?")
+        print("  • Scrape https://www.fda.gov/food/... again and show changes")
+        print("  • List all saved pages\n")
 
     def chat(self, user_message: str) -> None:
         self.history.append({"role": "user", "content": user_message})
 
-        MAX_ITERATIONS = 10  # prevent infinite tool-call loops
+        MAX_ITERATIONS = 10
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             if iteration > 1:
@@ -93,13 +85,11 @@ class FDAgent:
 
             tool_calls = [b for b in final.content if b.type == "tool_use"]
 
-            # No tool calls — agent is done, return normally
             if not tool_calls:
                 print()
                 self.history.append({"role": "assistant", "content": final.content})
                 return
 
-            # Execute tools and feed results back
             print()
             self.history.append({"role": "assistant", "content": final.content})
 
@@ -118,9 +108,7 @@ class FDAgent:
             self.history.append({"role": "user", "content": tool_results})
             print("\n🤖 Agent: ", end="", flush=True)
 
-        # Reached iteration limit — stop gracefully
-        print(f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}). Stopping to prevent infinite loop.")
-        print("    Try rephrasing your request or use 'clear' to reset memory.")
+        print(f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}). Stopping.")
 
     def run(self) -> None:
         while True:

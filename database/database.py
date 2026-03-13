@@ -1,31 +1,37 @@
 """
 database/database.py
 
-SQLite storage layer for the FDA Regulatory Intelligence Agent.
+SQL Server storage layer for the Regulatory Intelligence Agent.
 
 Schema:
-  documents   — one row per regulation (tracks latest version + metadata)
+  documents   — one row per saved page (tracks latest version + metadata)
   versions    — one row per saved version (full content, hash, timestamp)
   change_log  — one row per save event (audit trail: NEW / CHANGED / UNCHANGED)
-
-Replaces: flat .txt files in knowledge_base/ and _change_log.jsonl
 """
 
-import sqlite3
 import os
+import pyodbc
 from datetime import datetime
 from contextlib import contextmanager
-from config.config import DB_PATH
+from config.config import DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD, DB_DRIVER
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
+def _build_conn_str() -> str:
+    return (
+        f"DRIVER={{{DB_DRIVER}}};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={DB_NAME};"
+        f"UID={DB_USER};"
+        f"PWD={DB_PASSWORD};"
+        f"TrustServerCertificate=yes;"
+        f"Encrypt=yes;"
+    )
+
 @contextmanager
 def get_conn():
-    """Context manager — always closes connection, rolls back on error."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row          # rows behave like dicts
-    conn.execute("PRAGMA journal_mode=WAL") # safe for concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = pyodbc.connect(_build_conn_str(), timeout=30)
+    conn.autocommit = False
     try:
         yield conn
         conn.commit()
@@ -40,59 +46,73 @@ def get_conn():
 def init_db() -> None:
     """Create tables if they don't exist. Safe to call on every startup."""
     with get_conn() as conn:
-        conn.executescript("""
-            -- One row per regulation (e.g. "21CFR820")
-            CREATE TABLE IF NOT EXISTS documents (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                regulation_id   TEXT    NOT NULL UNIQUE,   -- e.g. "21CFR820"
-                title           INTEGER,                    -- CFR title number
-                part            INTEGER,                    -- CFR part number
-                source_url      TEXT,                       -- where it came from
-                latest_version_id INTEGER,                  -- FK → versions.id
-                first_fetched   TEXT    NOT NULL,
-                last_fetched    TEXT    NOT NULL,
-                total_versions  INTEGER NOT NULL DEFAULT 0
-            );
+        cursor = conn.cursor()
 
-            -- One row per saved version (full content stored here)
-            CREATE TABLE IF NOT EXISTS versions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                regulation_id   TEXT    NOT NULL,           -- FK → documents.regulation_id
-                version_number  INTEGER NOT NULL,           -- 1, 2, 3 ...
-                content         TEXT    NOT NULL,           -- full regulation text
-                content_hash    TEXT    NOT NULL,           -- SHA-256[:16] for change detection
-                content_length  INTEGER NOT NULL,           -- char count
-                status          TEXT    NOT NULL,           -- NEW | CHANGED | UNCHANGED
-                version_note    TEXT,
-                saved_at        TEXT    NOT NULL,
-                FOREIGN KEY (regulation_id) REFERENCES documents(regulation_id)
-            );
-
-            -- One row per save event (audit trail — never deleted)
-            CREATE TABLE IF NOT EXISTS change_log (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                regulation_id   TEXT    NOT NULL,
-                status          TEXT    NOT NULL,           -- NEW | CHANGED | UNCHANGED
-                content_hash    TEXT    NOT NULL,
-                prev_hash       TEXT,                       -- NULL for NEW entries
-                version_number  INTEGER,
-                version_note    TEXT,
-                logged_at       TEXT    NOT NULL
-            );
-
-            -- Indexes for fast queries
-            CREATE INDEX IF NOT EXISTS idx_versions_regulation
-                ON versions(regulation_id);
-            CREATE INDEX IF NOT EXISTS idx_versions_saved_at
-                ON versions(saved_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_change_log_regulation
-                ON change_log(regulation_id);
-            CREATE INDEX IF NOT EXISTS idx_change_log_status
-                ON change_log(status);
-            CREATE INDEX IF NOT EXISTS idx_change_log_logged_at
-                ON change_log(logged_at DESC);
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='documents' AND xtype='U')
+            CREATE TABLE documents (
+                id                INTEGER IDENTITY(1,1) PRIMARY KEY,
+                regulation_id     NVARCHAR(255) NOT NULL UNIQUE,
+                title             INTEGER,
+                part              INTEGER,
+                source_url        NVARCHAR(500),
+                latest_version_id INTEGER,
+                first_fetched     NVARCHAR(50)  NOT NULL,
+                last_fetched      NVARCHAR(50)  NOT NULL,
+                total_versions    INTEGER NOT NULL DEFAULT 0
+            )
         """)
-    print(f"✅ Database ready: {DB_PATH}")
+
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='versions' AND xtype='U')
+            CREATE TABLE versions (
+                id              INTEGER IDENTITY(1,1) PRIMARY KEY,
+                regulation_id   NVARCHAR(255) NOT NULL,
+                version_number  INTEGER       NOT NULL,
+                content         NVARCHAR(MAX) NOT NULL,
+                content_hash    NVARCHAR(64)  NOT NULL,
+                content_length  INTEGER       NOT NULL,
+                status          NVARCHAR(20)  NOT NULL,
+                version_note    NVARCHAR(500),
+                saved_at        NVARCHAR(50)  NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='change_log' AND xtype='U')
+            CREATE TABLE change_log (
+                id              INTEGER IDENTITY(1,1) PRIMARY KEY,
+                regulation_id   NVARCHAR(255) NOT NULL,
+                status          NVARCHAR(20)  NOT NULL,
+                content_hash    NVARCHAR(64)  NOT NULL,
+                prev_hash       NVARCHAR(64),
+                version_number  INTEGER,
+                version_note    NVARCHAR(500),
+                logged_at       NVARCHAR(50)  NOT NULL
+            )
+        """)
+
+        # Indexes
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_versions_regulation')
+            CREATE INDEX idx_versions_regulation ON versions(regulation_id)
+        """)
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_change_log_regulation')
+            CREATE INDEX idx_change_log_regulation ON change_log(regulation_id)
+        """)
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_change_log_status')
+            CREATE INDEX idx_change_log_status ON change_log(status)
+        """)
+
+        conn.commit()
+    print(f"✅ Database ready: {DB_SERVER}/{DB_NAME}")
+
+
+# ── Row → dict helper ─────────────────────────────────────────────────────────
+def _row_to_dict(cursor, row) -> dict:
+    return {desc[0]: val for desc, val in zip(cursor.description, row)}
 
 
 # ── Save / upsert a regulation version ───────────────────────────────────────
@@ -105,60 +125,51 @@ def save_regulation(
     title: int = None,
     part: int = None,
 ) -> dict:
-    """
-    Save a regulation version. Returns a dict with:
-      status        — NEW | CHANGED | UNCHANGED
-      version_number
-      prev_hash     — previous hash (None if NEW)
-      regulation_id
-    """
     now = datetime.now().isoformat()
 
     with get_conn() as conn:
-        # ── Check if this regulation exists ──────────────────────────────────
-        doc = conn.execute(
+        cursor = conn.cursor()
+
+        # Check if regulation exists
+        cursor.execute(
             "SELECT * FROM documents WHERE regulation_id = ?", (regulation_id,)
-        ).fetchone()
+        )
+        doc = cursor.fetchone()
 
         if doc is None:
-            # First time we've seen this regulation
+            # First save
             status         = "NEW"
             prev_hash      = None
             version_number = 1
 
-            conn.execute("""
+            cursor.execute("""
                 INSERT INTO documents
                     (regulation_id, title, part, source_url, first_fetched, last_fetched, total_versions)
                 VALUES (?, ?, ?, ?, ?, ?, 1)
             """, (regulation_id, title, part, source_url, now, now))
 
         else:
-            # Get the latest version's hash for comparison
-            latest = conn.execute("""
-                SELECT content_hash, version_number FROM versions
+            # Get latest version hash
+            cursor.execute("""
+                SELECT TOP 1 content_hash, version_number FROM versions
                 WHERE regulation_id = ?
                 ORDER BY version_number DESC
-                LIMIT 1
-            """, (regulation_id,)).fetchone()
-
-            prev_hash = latest["content_hash"] if latest else None
+            """, (regulation_id,))
+            latest = cursor.fetchone()
+            prev_hash = latest[0] if latest else None
 
             if prev_hash == content_hash:
-                # Content identical — log it, don't write a new version
-                status         = "UNCHANGED"
-                version_number = latest["version_number"]
-
-                conn.execute("""
+                # Unchanged
+                version_number = latest[1]
+                cursor.execute("""
                     INSERT INTO change_log
                         (regulation_id, status, content_hash, prev_hash, version_number, version_note, logged_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (regulation_id, "UNCHANGED", content_hash, prev_hash, version_number, version_note, now))
-
-                conn.execute(
+                    VALUES (?, 'UNCHANGED', ?, ?, ?, ?, ?)
+                """, (regulation_id, content_hash, prev_hash, version_number, version_note, now))
+                cursor.execute(
                     "UPDATE documents SET last_fetched = ? WHERE regulation_id = ?",
                     (now, regulation_id)
                 )
-
                 return {
                     "status":         "UNCHANGED",
                     "version_number": version_number,
@@ -167,10 +178,10 @@ def save_regulation(
                 }
             else:
                 status         = "CHANGED"
-                version_number = (latest["version_number"] if latest else 0) + 1
+                version_number = (latest[1] if latest else 0) + 1
 
-        # ── Write new version row ─────────────────────────────────────────────
-        cursor = conn.execute("""
+        # Insert new version
+        cursor.execute("""
             INSERT INTO versions
                 (regulation_id, version_number, content, content_hash,
                  content_length, status, version_note, saved_at)
@@ -179,10 +190,13 @@ def save_regulation(
             regulation_id, version_number, content, content_hash,
             len(content), status, version_note, now
         ))
-        version_id = cursor.lastrowid
 
-        # ── Update documents table ────────────────────────────────────────────
-        conn.execute("""
+        # Get the new version's ID
+        cursor.execute("SELECT @@IDENTITY")
+        version_id = int(cursor.fetchone()[0])
+
+        # Update documents
+        cursor.execute("""
             UPDATE documents
             SET latest_version_id = ?,
                 last_fetched      = ?,
@@ -190,11 +204,11 @@ def save_regulation(
                 source_url        = COALESCE(NULLIF(?, ''), source_url),
                 title             = COALESCE(?, title),
                 part              = COALESCE(?, part)
-            WHERE regulation_id = ?
+            WHERE regulation_id   = ?
         """, (version_id, now, source_url, title, part, regulation_id))
 
-        # ── Write change log row ──────────────────────────────────────────────
-        conn.execute("""
+        # Write change log
+        cursor.execute("""
             INSERT INTO change_log
                 (regulation_id, status, content_hash, prev_hash, version_number, version_note, logged_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -208,69 +222,83 @@ def save_regulation(
         }
 
 
-# ── Read latest version of a regulation ──────────────────────────────────────
+# ── Read latest version ───────────────────────────────────────────────────────
 def get_latest(regulation_id: str) -> dict | None:
-    """Return the latest version row, or None if not found."""
     with get_conn() as conn:
-        row = conn.execute("""
-            SELECT v.*, d.source_url, d.title, d.part
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 v.*, d.source_url, d.title, d.part
             FROM versions v
             JOIN documents d ON d.regulation_id = v.regulation_id
             WHERE v.regulation_id = ?
             ORDER BY v.version_number DESC
-            LIMIT 1
-        """, (regulation_id,)).fetchone()
-        return dict(row) if row else None
+        """, (regulation_id,))
+        row = cursor.fetchone()
+        return _row_to_dict(cursor, row) if row else None
 
 
-# ── Read a specific version by number ────────────────────────────────────────
+# ── Read specific version ─────────────────────────────────────────────────────
 def get_version(regulation_id: str, version_number: int) -> dict | None:
     with get_conn() as conn:
-        row = conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT * FROM versions
             WHERE regulation_id = ? AND version_number = ?
-        """, (regulation_id, version_number)).fetchone()
-        return dict(row) if row else None
+        """, (regulation_id, version_number))
+        row = cursor.fetchone()
+        return _row_to_dict(cursor, row) if row else None
 
 
-# ── List all regulations ──────────────────────────────────────────────────────
+# ── List all saved pages ──────────────────────────────────────────────────────
 def list_regulations(filter_str: str = "") -> list[dict]:
-    """Return all documents with their latest version info."""
     with get_conn() as conn:
-        query = """
-            SELECT d.*, v.content_hash, v.content_length, v.saved_at as latest_saved_at,
-                   v.version_number as latest_version_number, v.status as latest_status
-            FROM documents d
-            LEFT JOIN versions v ON v.id = d.latest_version_id
-        """
+        cursor = conn.cursor()
         if filter_str:
-            query += " WHERE d.regulation_id LIKE ?"
-            rows = conn.execute(query, (f"%{filter_str}%",)).fetchall()
+            cursor.execute("""
+                SELECT d.*, v.content_hash, v.content_length,
+                       v.saved_at as last_fetched,
+                       v.version_number as latest_version_number,
+                       v.status as latest_status
+                FROM documents d
+                LEFT JOIN versions v ON v.id = d.latest_version_id
+                WHERE d.regulation_id LIKE ?
+            """, (f"%{filter_str}%",))
         else:
-            rows = conn.execute(query).fetchall()
-        return [dict(r) for r in rows]
+            cursor.execute("""
+                SELECT d.*, v.content_hash, v.content_length,
+                       v.saved_at as last_fetched,
+                       v.version_number as latest_version_number,
+                       v.status as latest_status
+                FROM documents d
+                LEFT JOIN versions v ON v.id = d.latest_version_id
+            """)
+        rows = cursor.fetchall()
+        return [_row_to_dict(cursor, r) for r in rows]
 
 
-# ── List all versions for a regulation ───────────────────────────────────────
+# ── List versions for a regulation ───────────────────────────────────────────
 def list_versions(regulation_id: str) -> list[dict]:
     with get_conn() as conn:
-        rows = conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT id, regulation_id, version_number, content_hash,
                    content_length, status, version_note, saved_at
             FROM versions
             WHERE regulation_id = ?
             ORDER BY version_number ASC
-        """, (regulation_id,)).fetchall()
-        return [dict(r) for r in rows]
+        """, (regulation_id,))
+        rows = cursor.fetchall()
+        return [_row_to_dict(cursor, r) for r in rows]
 
 
-# ── Get change log entries ────────────────────────────────────────────────────
+# ── Get change log ────────────────────────────────────────────────────────────
 def get_change_log(
     filter_str: str = "",
     limit: int = 20,
     changed_only: bool = False,
 ) -> list[dict]:
     with get_conn() as conn:
+        cursor = conn.cursor()
         conditions = []
         params     = []
 
@@ -283,25 +311,28 @@ def get_change_log(
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         params.append(limit)
 
-        rows = conn.execute(f"""
-            SELECT * FROM change_log
+        cursor.execute(f"""
+            SELECT TOP (?) * FROM change_log
             {where}
             ORDER BY logged_at DESC
-            LIMIT ?
-        """, params).fetchall()
-        return [dict(r) for r in rows]
+        """, [limit] + params[:-1])
+        rows = cursor.fetchall()
+        return [_row_to_dict(cursor, r) for r in rows]
 
 
-# ── DB stats (for diagnostics) ────────────────────────────────────────────────
+# ── DB stats ──────────────────────────────────────────────────────────────────
 def get_stats() -> dict:
     with get_conn() as conn:
-        docs     = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        versions = conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
-        changes  = conn.execute("SELECT COUNT(*) FROM change_log WHERE status = 'CHANGED'").fetchone()[0]
-        db_size  = os.path.getsize(DB_PATH) / 1024 if os.path.exists(DB_PATH) else 0
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents")
+        docs = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM versions")
+        versions = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM change_log WHERE status = 'CHANGED'")
+        changes = cursor.fetchone()[0]
         return {
-            "regulations": docs,
+            "regulations":    docs,
             "total_versions": versions,
-            "change_events": changes,
-            "db_size_kb": round(db_size, 1),
+            "change_events":  changes,
+            "db_size_kb":     "SQL Server",
         }

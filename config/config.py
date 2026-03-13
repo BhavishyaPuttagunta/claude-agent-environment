@@ -5,14 +5,16 @@ load_dotenv()
 
 # ── API ───────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-MODEL             = "claude-opus-4-5"
-MAX_TOKENS        = 4096
+MODEL             = "claude-haiku-4-5-20251001"
+MAX_TOKENS        = 1024
 
-# ── Storage ───────────────────────────────────────────────────────────────────
-# SQLite database — single file, versioned, queryable
-# Replaces the old knowledge_base/ flat .txt files
-_base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_base, "fda_knowledge.db")
+# ── SQL Server Database ───────────────────────────────────────────────────────
+DB_SERVER   = os.getenv("DB_SERVER",   "192.168.2.98,1433")
+DB_NAME     = os.getenv("DB_NAME",     "FTR_DEV")
+DB_USER     = os.getenv("DB_USER",     "Princeton")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "P!T$sql")
+DB_DRIVER   = os.getenv("DB_DRIVER",   "ODBC Driver 18 for SQL Server")
+
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
 SCRAPE_TIMEOUT    = 30
