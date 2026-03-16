@@ -4,9 +4,10 @@ database/database.py
 SQL Server storage layer for the Regulatory Intelligence Agent.
 
 Schema:
-  documents   — one row per saved page (tracks latest version + metadata)
+  documents   — one row per saved regulation (latest version + metadata)
   versions    — one row per saved version (full content, hash, timestamp)
   change_log  — one row per save event (audit trail: NEW / CHANGED / UNCHANGED)
+  telemetry   — one row per bot interaction (for Power BI dashboard)
 """
 
 import os
@@ -44,7 +45,7 @@ def get_conn():
 
 # ── Schema creation ───────────────────────────────────────────────────────────
 def init_db() -> None:
-    """Create tables if they don't exist. Safe to call on every startup."""
+    """Create all tables if they don't exist. Safe to call on every startup."""
     with get_conn() as conn:
         cursor = conn.cursor()
 
@@ -92,19 +93,34 @@ def init_db() -> None:
             )
         """)
 
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='telemetry' AND xtype='U')
+            CREATE TABLE telemetry (
+                id               INTEGER IDENTITY(1,1) PRIMARY KEY,
+                user_id          NVARCHAR(255),
+                user_message     NVARCHAR(MAX),
+                bot_response     NVARCHAR(MAX),
+                tools_called     NVARCHAR(500),
+                response_time_ms INTEGER,
+                success          BIT NOT NULL DEFAULT 1,
+                error_message    NVARCHAR(500),
+                platform         NVARCHAR(50) DEFAULT 'teams',
+                logged_at        DATETIME DEFAULT GETDATE()
+            )
+        """)
+
         # Indexes
-        cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_versions_regulation')
-            CREATE INDEX idx_versions_regulation ON versions(regulation_id)
-        """)
-        cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_change_log_regulation')
-            CREATE INDEX idx_change_log_regulation ON change_log(regulation_id)
-        """)
-        cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_change_log_status')
-            CREATE INDEX idx_change_log_status ON change_log(status)
-        """)
+        for idx, table, col in [
+            ("idx_versions_regulation",   "versions",   "regulation_id"),
+            ("idx_change_log_regulation", "change_log", "regulation_id"),
+            ("idx_change_log_status",     "change_log", "status"),
+            ("idx_telemetry_user",        "telemetry",  "user_id"),
+            ("idx_telemetry_logged_at",   "telemetry",  "logged_at"),
+        ]:
+            cursor.execute(f"""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='{idx}')
+                CREATE INDEX {idx} ON {table}({col})
+            """)
 
         conn.commit()
     print(f"✅ Database ready: {DB_SERVER}/{DB_NAME}")
@@ -130,36 +146,30 @@ def save_regulation(
     with get_conn() as conn:
         cursor = conn.cursor()
 
-        # Check if regulation exists
         cursor.execute(
             "SELECT * FROM documents WHERE regulation_id = ?", (regulation_id,)
         )
         doc = cursor.fetchone()
 
         if doc is None:
-            # First save
             status         = "NEW"
             prev_hash      = None
             version_number = 1
-
             cursor.execute("""
                 INSERT INTO documents
                     (regulation_id, title, part, source_url, first_fetched, last_fetched, total_versions)
                 VALUES (?, ?, ?, ?, ?, ?, 1)
             """, (regulation_id, title, part, source_url, now, now))
-
         else:
-            # Get latest version hash
             cursor.execute("""
                 SELECT TOP 1 content_hash, version_number FROM versions
                 WHERE regulation_id = ?
                 ORDER BY version_number DESC
             """, (regulation_id,))
-            latest = cursor.fetchone()
+            latest    = cursor.fetchone()
             prev_hash = latest[0] if latest else None
 
             if prev_hash == content_hash:
-                # Unchanged
                 version_number = latest[1]
                 cursor.execute("""
                     INSERT INTO change_log
@@ -180,22 +190,17 @@ def save_regulation(
                 status         = "CHANGED"
                 version_number = (latest[1] if latest else 0) + 1
 
-        # Insert new version
         cursor.execute("""
             INSERT INTO versions
                 (regulation_id, version_number, content, content_hash,
                  content_length, status, version_note, saved_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            regulation_id, version_number, content, content_hash,
-            len(content), status, version_note, now
-        ))
+        """, (regulation_id, version_number, content, content_hash,
+              len(content), status, version_note, now))
 
-        # Get the new version's ID
         cursor.execute("SELECT @@IDENTITY")
         version_id = int(cursor.fetchone()[0])
 
-        # Update documents
         cursor.execute("""
             UPDATE documents
             SET latest_version_id = ?,
@@ -207,7 +212,6 @@ def save_regulation(
             WHERE regulation_id   = ?
         """, (version_id, now, source_url, title, part, regulation_id))
 
-        # Write change log
         cursor.execute("""
             INSERT INTO change_log
                 (regulation_id, status, content_hash, prev_hash, version_number, version_note, logged_at)
@@ -220,6 +224,41 @@ def save_regulation(
             "prev_hash":      prev_hash,
             "regulation_id":  regulation_id,
         }
+
+
+# ── Telemetry logging ─────────────────────────────────────────────────────────
+def log_telemetry(
+    user_id: str,
+    user_message: str,
+    bot_response: str = "",
+    tools_called: list = None,
+    response_time_ms: int = 0,
+    success: bool = True,
+    error_message: str = "",
+    platform: str = "teams",
+) -> None:
+    """Log every bot interaction for Power BI dashboard."""
+    try:
+        tools_str = ", ".join(tools_called) if tools_called else ""
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO telemetry
+                    (user_id, user_message, bot_response, tools_called,
+                     response_time_ms, success, error_message, platform)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id,
+                user_message[:4000],
+                bot_response[:4000],
+                tools_str[:500],
+                response_time_ms,
+                1 if success else 0,
+                error_message[:500],
+                platform,
+            ))
+    except Exception as e:
+        print(f"⚠️  Telemetry log failed: {e}")
 
 
 # ── Read latest version ───────────────────────────────────────────────────────
@@ -249,7 +288,7 @@ def get_version(regulation_id: str, version_number: int) -> dict | None:
         return _row_to_dict(cursor, row) if row else None
 
 
-# ── List all saved pages ──────────────────────────────────────────────────────
+# ── List all saved regulations ────────────────────────────────────────────────
 def list_regulations(filter_str: str = "") -> list[dict]:
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -309,13 +348,12 @@ def get_change_log(
             conditions.append("status != 'UNCHANGED'")
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
 
         cursor.execute(f"""
             SELECT TOP (?) * FROM change_log
             {where}
             ORDER BY logged_at DESC
-        """, [limit] + params[:-1])
+        """, [limit] + params)
         rows = cursor.fetchall()
         return [_row_to_dict(cursor, r) for r in rows]
 
@@ -330,9 +368,12 @@ def get_stats() -> dict:
         versions = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM change_log WHERE status = 'CHANGED'")
         changes = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM telemetry")
+        interactions = cursor.fetchone()[0]
         return {
             "regulations":    docs,
             "total_versions": versions,
             "change_events":  changes,
-            "db_size_kb":     "SQL Server",
+            "interactions":   interactions,
+            "db":             f"{DB_SERVER}/{DB_NAME}",
         }

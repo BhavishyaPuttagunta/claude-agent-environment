@@ -335,8 +335,8 @@ def _read_regulation(regulation_id: str, version_number: int = None) -> str:
     )
     # Return header + truncated content so Claude's context doesn't overflow
     content = row["content"]
-    if len(content) > 3000:
-        content = content[:3000] + f"\n\n[... content truncated for display. Full content is {row['content_length']:,} chars ...]"
+    if len(content) > 8000:
+        content = content[:8000] + f"\n\n[... content truncated for display. Full content is {row['content_length']:,} chars ...]"
     return header + content
 
 
@@ -354,7 +354,7 @@ def _list_regulations(filter_str: str = "") -> str:
     lines = [
         f"📚 Knowledge Base — {stats['regulations']} page(s) saved | "
         f"{stats['total_versions']} total versions | "
-        f"{stats['db_size_kb']} KB\n"
+        f"{stats.get('db', stats.get('db_size_kb', 'SQL Server'))}\n"
     ]
     for r in rows:
         size_kb = (r.get("content_length") or 0) / 1024

@@ -126,8 +126,29 @@ class FDAgent:
                     case "history":
                         print(json.dumps(self.history, indent=2, default=str))
                     case _:
+                        import time
+                        from database.database import log_telemetry
                         print("\n🤖 Agent: ", end="", flush=True)
-                        self.chat(user_input)
+                        start_ms = int(time.time() * 1000)
+                        try:
+                            self.chat(user_input)
+                            log_telemetry(
+                                user_id="cli",
+                                user_message=user_input,
+                                response_time_ms=int(time.time()*1000)-start_ms,
+                                success=True,
+                                platform="cli",
+                            )
+                        except Exception as chat_err:
+                            log_telemetry(
+                                user_id="cli",
+                                user_message=user_input,
+                                response_time_ms=int(time.time()*1000)-start_ms,
+                                success=False,
+                                error_message=str(chat_err),
+                                platform="cli",
+                            )
+                            raise
             except KeyboardInterrupt:
                 print("\n  (Use 'exit' to quit cleanly)")
             except anthropic.APIStatusError as e:
